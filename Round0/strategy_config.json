@@ -1,0 +1,28 @@
+{
+  "strategy_name": "IMC Prosperity Season 4 Tutorial",
+  "version": "1.0",
+  "initial_cash": 100000,
+  "position_limits": {
+    "EMERALDS": 50,
+    "TOMATOES": 100
+  },
+  "strategy_parameters": {
+    "cooldown_period": 1000,
+    "momentum_window": 10,
+    "price_history_limit": 50
+  },
+  "product_strategies": {
+    "EMERALDS": {
+      "type": "conservative_market_making",
+      "target_spread": "12-16 points",
+      "risk_level": "low",
+      "description": "Stable prices, high liquidity, conservative approach"
+    },
+    "TOMATOES": {
+      "type": "dynamic_momentum_market_making",
+      "target_spread": "10-14 points",
+      "risk_level": "medium",
+      "description": "Higher volatility, momentum-aware trading"
+    }
+  }
+}
