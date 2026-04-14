@@ -90,11 +90,12 @@ class Trader:
                 d = jsonpickle.decode(raw)
                 if isinstance(d, dict):
                     d.setdefault("aco_ema", None)
+                    d.setdefault("imbalance_history", {})
                     return d
             except Exception:
                 pass
         # Only ACO needs state (EMA). IPR has no state — just buy.
-        return {"aco_ema": None}
+        return {"aco_ema": None, "imbalance_history": {}}
 
     @staticmethod
     def _save(td: dict) -> str:
@@ -259,9 +260,34 @@ class Trader:
         bid_vol = sum(od.buy_orders.values()) if od.buy_orders else 0
         ask_vol = sum(abs(v) for v in od.sell_orders.values()) if od.sell_orders else 0
         
+        imbalance = 0
         if bid_vol + ask_vol > 0:
             imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
             fv += imbalance * 1  # Small nudge toward imbalance direction
+        
+        # ---- Step 1: Track imbalance history ----
+        if product not in td["imbalance_history"]:
+            td["imbalance_history"][product] = []
+        
+        td["imbalance_history"][product].append(imbalance)
+        if len(td["imbalance_history"][product]) > 10:
+            td["imbalance_history"][product].pop(0)
+        
+        # ---- Step 2: Detect persistent bias ----
+        avg_imbalance = sum(td["imbalance_history"][product]) / len(td["imbalance_history"][product])
+        
+        # ---- Step 3: Use it ONLY when consistent ----
+        trend = "neutral"
+        if avg_imbalance > 0.25:
+            trend = "up"
+        elif avg_imbalance < -0.25:
+            trend = "down"
+        
+        # ---- 🚀 UPGRADE 1: Add "price influence mode" ----
+        # When imbalance is strong → push clearing price
+        influence = False
+        if abs(avg_imbalance) > 0.35:
+            influence = True
         
         # Ensure fair value is always integer to avoid fractional prices
         fv = int(round(fv))
@@ -280,13 +306,13 @@ class Trader:
         #  We sweep ALL mispriced levels, not just the top of book.
         # ═══════════════════════════════════════════════════════════
 
-        # ── Take cheap asks (price < FV) ───────────────────────────
+        # ── Take cheap asks (price <= FV + 1) ───────────────────────
         if od.sell_orders and buy_cap > 0:
             for ask_px in sorted(od.sell_orders.keys()):
                 if buy_cap <= 0:
                     break
-                if ask_px < fv:
-                    # This ask is below fair value — take it
+                if ask_px <= fv + 1:
+                    # This ask is at or below fair value + 1 — take it
                     avail = abs(od.sell_orders[ask_px])
                     take  = min(avail, buy_cap)
                     orders.append(Order(product, ask_px, take))
@@ -294,13 +320,13 @@ class Trader:
                 else:
                     break  # Sorted ascending; no more cheap asks
 
-        # ── Take rich bids (price > FV) ────────────────────────────
+        # ── Take rich bids (price >= FV - 1) ────────────────────────
         if od.buy_orders and sell_cap > 0:
             for bid_px in sorted(od.buy_orders.keys(), reverse=True):
                 if sell_cap <= 0:
                     break
-                if bid_px > fv:
-                    # This bid is above fair value — sell into it
+                if bid_px >= fv - 1:
+                    # This bid is at or above fair value - 1 — sell into it
                     avail = od.buy_orders[bid_px]
                     take  = min(avail, sell_cap)
                     orders.append(Order(product, bid_px, -take))
@@ -340,25 +366,68 @@ class Trader:
         bid_price = int(fv - offset)
         ask_price = int(fv + offset)
 
+        # ── Dynamic size scaling based on position ───────────────────────
+        if abs(pos) < 30:
+            size = 20
+        elif abs(pos) < 60:
+            size = 12
+        else:
+            size = 6
+        
+        # ---- Trend-based behavior adjustments ----
+        # 🚀 Use trend for behavior adjustment, NOT heavy FV changes
+        
+        # 🔹 Case 1: Upward "vibe"
+        if trend == "up":
+            # be more aggressive buyer
+            bid_price += 1
+            size = int(size * 1.3)
+        
+        # 🔹 Case 2: Downward "vibe"
+        if trend == "down":
+            # be more aggressive seller
+            ask_price -= 1
+            size = int(size * 1.3)
+
+        # ---- 🚀 UPGRADE 2: Concentrate size (CRITICAL) ----
+        # Replace L1 + L2 + sponge with concentrated size when influence is detected
+        
+        if influence:
+            # concentrate size near one side
+            # 🔹 Case: upward pressure
+            if trend == "up":
+                aggressive_bid = int(fv + 1)
+                size = min(buy_cap, int(self.LIMIT * 0.6))
+                orders.append(Order(product, aggressive_bid, size))
+                return orders
+            
+            # 🔹 Case: downward pressure
+            if trend == "down":
+                aggressive_ask = int(fv - 1)
+                size = min(sell_cap, int(self.LIMIT * 0.6))
+                orders.append(Order(product, aggressive_ask, -size))
+                return orders
+        
+        # ---- Normal multi-layer quoting (when no influence) ----
         # ── L1 Make: FV ± 2 ───────────────────────────────────────
         if buy_cap > 0:
-            l1_bid = min(buy_cap, self.ACO_MAKE_SIZE)
+            l1_bid = min(buy_cap, size)
             orders.append(Order(product, bid_price, l1_bid))
             buy_cap -= l1_bid
 
         if sell_cap > 0:
-            l1_ask = min(sell_cap, self.ACO_MAKE_SIZE)
+            l1_ask = min(sell_cap, size)
             orders.append(Order(product, ask_price, -l1_ask))
             sell_cap -= l1_ask
 
         # ── L2 Make: FV ± 2*offset (deeper liquidity) ────────────────────
         if buy_cap > 0:
-            l2_bid = min(buy_cap, self.ACO_MAKE_SIZE)
+            l2_bid = min(buy_cap, size)
             orders.append(Order(product, int(bid_price - offset), l2_bid))
             buy_cap -= l2_bid
 
         if sell_cap > 0:
-            l2_ask = min(sell_cap, self.ACO_MAKE_SIZE)
+            l2_ask = min(sell_cap, size)
             orders.append(Order(product, int(ask_price + offset), -l2_ask))
             sell_cap -= l2_ask
 
