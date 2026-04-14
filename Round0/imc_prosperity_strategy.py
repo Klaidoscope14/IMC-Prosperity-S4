@@ -756,7 +756,13 @@ class Trader:
             return False
         
         recent_signals = self.signal_history[product][-self.signal_confirmation_periods:]
-        consistent_signals = sum(1 for s in recent_signals if s == combined_signal['overall_signal'])
+        
+        # Handle both old and new signal formats
+        current_signal_value = combined_signal.get('action', 'hold')
+        if 'overall_signal' in combined_signal:  # Fallback for old format
+            current_signal_value = combined_signal['overall_signal']
+        
+        consistent_signals = sum(1 for s in recent_signals if s == current_signal_value)
         
         # Require consistent signals for confirmation
         if consistent_signals < self.signal_confirmation_periods - 1:
@@ -767,8 +773,12 @@ class Trader:
     def update_trading_frequency_tracking(self, product: str, signal: Dict, timestamp: int, 
                                         executed_trade: bool = False):
         """Update tracking variables for frequency reduction"""
-        # Update signal history
-        self.signal_history[product].append(signal['overall_signal'])
+        # Update signal history - handle both old and new signal formats
+        signal_value = signal.get('action', 'hold')  # Use 'action' for simplified signals
+        if 'overall_signal' in signal:  # Fallback for old format
+            signal_value = signal['overall_signal']
+        
+        self.signal_history[product].append(signal_value)
         if len(self.signal_history[product]) > 20:  # Keep last 20 signals
             self.signal_history[product] = self.signal_history[product][-20:]
         
