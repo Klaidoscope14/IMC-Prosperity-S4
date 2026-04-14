@@ -48,7 +48,7 @@ class Trader:
         self.max_history_length = 100
         self.momentum_window = 10
         self.mean_reversion_window = 20
-        self.base_position_size = {'EMERALDS': 6, 'TOMATOES': 8}
+        self.base_position_size = {'EMERALDS': 10, 'TOMATOES': 12}
         
         # Advanced strategy parameters
         self.momentum_threshold = 3.0
@@ -99,13 +99,13 @@ class Trader:
         self.min_signal_threshold = 0.6  # Minimum combined signal strength to trade
         self.signal_persistence_threshold = 0.4  # Minimum signal to maintain position
         
-        # Trading frequency reduction parameters
+        # Trading frequency reduction parameters - FIX 4: Relaxed constraints
         self.frequency_reduction_enabled = True
-        self.trade_cooldown_period = 5  # Minimum periods between trades for same product
-        self.signal_confirmation_periods = 3  # Periods to confirm signal before trading
-        self.max_trades_per_session = 20  # Maximum trades per product per session
+        self.trade_cooldown_period = 1  # FIX 4: Reduced from 5 to 1
+        self.signal_confirmation_periods = 1  # FIX 4: Reduced from 3 to 1
+        self.max_trades_per_session = 1000  # FIX 4: Increased from 20 to 1000
         self.volatility_based_filtering = True
-        self.min_volatility_threshold = 2  # Minimum volatility for active trading
+        self.min_volatility_threshold = 0  # FIX 5: Reduced from 2 to 0
         self.max_volatility_threshold = 20  # Maximum volatility for safe trading
         
         # Trading frequency tracking
@@ -243,10 +243,9 @@ class Trader:
         available_buy_capacity = position_limit - current_position
         available_sell_capacity = position_limit + current_position
         
-        # SIMPLIFIED TRADING LOGIC
-        if (signal_decision['action'] == 'buy' and 
-            can_trade and available_buy_capacity > 0):
-            
+        # SIMPLIFIED TRADING LOGIC - FIX 1: Handle 'both' action for pure market making
+        if signal_decision['action'] in ['buy', 'both'] and can_trade and available_buy_capacity > 0:
+            # place buy order
             buy_price = self.calculate_simplified_buy_price(product, order_depth, fair_price, edge_info)
             if buy_price is not None:
                 buy_quantity = min(dynamic_size, available_buy_capacity)
@@ -255,9 +254,8 @@ class Trader:
                     # Update tracking for executed trade
                     self.update_trading_frequency_tracking(product, signal_decision, state.timestamp, True)
         
-        elif (signal_decision['action'] == 'sell' and 
-              can_trade and available_sell_capacity > 0):
-            
+        if signal_decision['action'] in ['sell', 'both'] and can_trade and available_sell_capacity > 0:
+            # place sell order
             sell_price = self.calculate_simplified_sell_price(product, order_depth, fair_price, edge_info)
             if sell_price is not None:
                 sell_quantity = min(dynamic_size, available_sell_capacity)
@@ -301,36 +299,42 @@ class Trader:
     
     def get_pure_market_making_decision(self, product: str, fair_price: int, order_depth, state: TradingState) -> Dict:
         """
-        Pure market making - no complex signals, just basic bid/ask placement
+        Pure market making - always quote both sides
         """
         decision = {
-            'action': 'hold',
-            'confidence': 0.0,
+            'action': 'both',  # FIX 2: Always quote both sides
+            'confidence': 0.6,  # FIX 2: Fixed confidence level
             'signal_type': 'pure_market_making'
         }
         
-        # Simple market making logic - always place quotes on both sides
+        # Check basic market data availability
         best_bid = self.get_best_bid(order_depth)
         best_ask = self.get_best_ask(order_depth)
         
         if best_bid is None or best_ask is None or fair_price is None:
+            decision['action'] = 'hold'
             return decision
         
-        # Check if we have capacity to trade
+        # Check if we have capacity to trade on both sides
         current_position = state.position.get(product, 0)
         position_limit = self.position_limits[product]
         
-        # Simple decision: always provide liquidity if we have capacity
-        if current_position < position_limit * 0.8:  # Can buy more
-            decision['action'] = 'buy'
-            decision['confidence'] = 0.5  # Moderate confidence for pure MM
+        # Only quote both sides if we have capacity for both
+        can_buy = current_position < position_limit * 0.8
+        can_sell = current_position > -position_limit * 0.8
         
-        if current_position > -position_limit * 0.8:  # Can sell more
-            if decision['action'] == 'buy':
-                decision['action'] = 'both'  # Can do both sides
-            else:
-                decision['action'] = 'sell'
-            decision['confidence'] = 0.5
+        if can_buy and can_sell:
+            decision['action'] = 'both'
+            decision['confidence'] = 0.6
+        elif can_buy:
+            decision['action'] = 'buy'
+            decision['confidence'] = 0.6
+        elif can_sell:
+            decision['action'] = 'sell'
+            decision['confidence'] = 0.6
+        else:
+            decision['action'] = 'hold'
+            decision['confidence'] = 0.0
         
         return decision
     
@@ -434,7 +438,7 @@ class Trader:
     
     def calculate_simplified_buy_price(self, product: str, order_depth, fair_price: int, edge_info: Dict) -> int:
         """
-        Simplified buy price calculation - no complex signal interference
+        Simplified buy price calculation - FIX 3: Top of book placement
         """
         best_bid = self.get_best_bid(order_depth)
         best_ask = self.get_best_ask(order_depth)
@@ -442,18 +446,12 @@ class Trader:
         if best_bid is None or best_ask is None or fair_price is None:
             return None
         
-        spread = best_ask - best_bid
-        
-        # Simple logic: place between best bid and fair price, never cross spread
-        if fair_price > best_bid:
-            max_price = min(fair_price, best_bid + max(1, spread // 2))
-            return min(max_price, best_ask - 1)
-        else:
-            return best_bid
+        # FIX 3: Improve quote aggressiveness - place at top of book
+        return best_bid + 1
     
     def calculate_simplified_sell_price(self, product: str, order_depth, fair_price: int, edge_info: Dict) -> int:
         """
-        Simplified sell price calculation - no complex signal interference
+        Simplified sell price calculation - FIX 3: Top of book placement
         """
         best_bid = self.get_best_bid(order_depth)
         best_ask = self.get_best_ask(order_depth)
@@ -461,14 +459,8 @@ class Trader:
         if best_bid is None or best_ask is None or fair_price is None:
             return None
         
-        spread = best_ask - best_bid
-        
-        # Simple logic: place between fair price and best ask, never cross spread
-        if fair_price < best_ask:
-            min_price = max(fair_price, best_ask - max(1, spread // 2))
-            return max(min_price, best_bid + 1)
-        else:
-            return best_ask
+        # FIX 3: Improve quote aggressiveness - place at top of book
+        return best_ask - 1
 
     def calculate_fair_price(self, product: str, order_depth) -> int:
         """Calculate fair price from order book"""
