@@ -1,3 +1,4 @@
+
 """
 IMC Prosperity 4 – Round 1 – V4: Aggressive Mathematical Edges
 ================================================================
@@ -47,8 +48,12 @@ class Trader:
     ACO_ANCHOR     = 10_000  # Structural mean-reversion center
     ACO_EMA_ALPHA  = 0.20    # Fast EMA — tracks local price quickly
     ACO_ANCHOR_WT  = 0.50    # FV = 50% EMA + 50% anchor
-    ACO_MAKE_OFFSET = 2      # Quote spread: FV ± 2 ticks
-    ACO_MAKE_SIZE   = 15     # Size per make quote
+    ACO_TAKE_EDGE   = 3      # Minimum edge to cross and take liquidity
+    ACO_EXTREME_BUY = 9992   # Data-driven lower dislocation threshold
+    ACO_EXTREME_SELL = 10008 # Data-driven upper dislocation threshold
+    ACO_EXTREME_SIZE = 36     # Aggressive take size in extreme dislocations
+    ACO_MAKE_SIZE_1 = 14     # L1 passive quote size
+    ACO_MAKE_SIZE_2 = 8      # L2 passive quote size
     ACO_INV_THRESH  = 40     # Position threshold for inventory skew
     ACO_INV_SKEW_1  = 1      # Skew ticks when |pos| > 40
     ACO_INV_SKEW_2  = 2      # Skew ticks when |pos| > 60
@@ -88,11 +93,18 @@ class Trader:
                 if isinstance(d, dict):
                     d.setdefault("aco_ema", None)
                     d.setdefault("imbalance_history", {})
+                    d.setdefault("ipr_last_mid", None)
+                    d.setdefault("ipr_drift_ema", 0.0)
                     return d
             except Exception:
                 pass
         # Only ACO needs state (EMA). IPR has no state — just buy.
-        return {"aco_ema": None, "imbalance_history": {}}
+        return {
+            "aco_ema": None,
+            "imbalance_history": {},
+            "ipr_last_mid": None,
+            "ipr_drift_ema": 0.0,
+        }
 
     @staticmethod
     def _save(td: dict) -> str:
@@ -169,7 +181,7 @@ class Trader:
             # Clearing condition: buy volume >= sell volume
             if buy_vol_at_price >= sell_vol_at_price:
                 executable_volume = min(buy_vol_at_price, sell_vol_at_price)
-                if executable_volume > max_executable_volume or (executable_volume == max_executable_volume and price > clearing_price):
+                if executable_volume > max_executable_volume or (executable_volume == max_executable_volume and (clearing_price is None or price > clearing_price)):
                     max_executable_volume = executable_volume
                     clearing_price = price
         
@@ -360,6 +372,14 @@ class Trader:
         od  = state.order_depths[product]
         pos = self._pos(state, product)
 
+        # Track short-horizon drift to choose a stronger refill bid when asks are thin.
+        if od.buy_orders and od.sell_orders:
+            ipr_mid = (max(od.buy_orders.keys()) + min(od.sell_orders.keys())) / 2.0
+            if td["ipr_last_mid"] is not None:
+                step = ipr_mid - td["ipr_last_mid"]
+                td["ipr_drift_ema"] = 0.25 * step + 0.75 * td["ipr_drift_ema"]
+            td["ipr_last_mid"] = ipr_mid
+
         # How much more can we buy? (Hard limit enforcement)
         buy_cap = self.LIMIT - pos
 
@@ -381,11 +401,27 @@ class Trader:
         # Backstop bid
         # ── BACKSTOP BID ───────────────────────────────────────────
         #    If the ask side was thin and we couldn't fill entirely,
-        #    place the remaining capacity as a bid at best_bid + 1
-        #    to catch any incoming sell flow next tick.
+        #    place layered aggressive bids to re-fill quickly.
         if buy_cap > 0 and od.buy_orders:
             best_bid = max(od.buy_orders.keys())
-            orders.append(Order(product, best_bid + 1, buy_cap))
+            best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
+            drift_boost = 1 if td["ipr_drift_ema"] > 0 else 0
+
+            # Anchor remainder to ask-side to avoid sitting too far below next fill.
+            if best_ask is not None:
+                refill_px_1 = best_ask if drift_boost > 0 else best_ask - 1
+            else:
+                refill_px_1 = best_bid + 1
+            refill_sz_1 = min(buy_cap, 30)
+            orders.append(Order(product, refill_px_1, refill_sz_1))
+            buy_cap -= refill_sz_1
+
+            if buy_cap > 0:
+                if best_ask is not None:
+                    refill_px_2 = best_ask - 1
+                else:
+                    refill_px_2 = best_bid
+                orders.append(Order(product, refill_px_2, buy_cap))
 
         # ── NEVER SELL ─────────────────────────────────────────────
         #    No sell orders.  No trimming.  No scalping.
@@ -426,6 +462,10 @@ class Trader:
         if mid is None:
             return orders
 
+        # Guard against auction artifacts that print zero or near-zero mids.
+        if mid < 1000:
+            return orders
+
         # ── Step 1: Update fast EMA ────────────────────────────────
         #    alpha = 0.20 → responsive to recent moves, but not noise.
         if td["aco_ema"] is None:
@@ -459,7 +499,7 @@ class Trader:
         elif pos < -self.ACO_INV_THRESH:
             skew = self.ACO_INV_SKEW_1        # Shift FV up 1
 
-        fv = round(raw_fv + skew)
+        fv = float(raw_fv + skew)
 
         # ---- Imbalance calculation for better fills -----------------
         # Calculate order book imbalance: (bid_vol - ask_vol) / (bid_vol + ask_vol)
@@ -471,7 +511,8 @@ class Trader:
         imbalance = 0
         if bid_vol + ask_vol > 0:
             imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-            fv += imbalance * 1  # Small nudge toward imbalance direction
+            # ACO is mean-reverting; positive imbalance is contrarian bearish.
+            fv -= imbalance * 0.8
         
         # ---- Step 1: Track imbalance history ----
         if product not in td["imbalance_history"]:
@@ -481,15 +522,8 @@ class Trader:
         if len(td["imbalance_history"][product]) > 10:
             td["imbalance_history"][product].pop(0)
         
-        # ---- Step 2: Detect persistent bias ----
         avg_imbalance = sum(td["imbalance_history"][product]) / len(td["imbalance_history"][product])
-        
-        # ---- Step 3: Use it ONLY when consistent ----
-        trend = "neutral"
-        if avg_imbalance > 0.25:
-            trend = "up"
-        elif avg_imbalance < -0.25:
-            trend = "down"
+        fv -= avg_imbalance * 0.5
         
         # Ensure fair value is always integer to avoid fractional prices
         fv = int(round(fv))
@@ -498,10 +532,6 @@ class Trader:
         buy_cap  = self.LIMIT - pos   # Max additional buy volume
         sell_cap = self.LIMIT + pos   # Max additional sell volume
 
-        # ═══════════════════════════════════════════════════════════
-        #  PHASE 2: MAKE — The "Intentional & Calm" Spread Capture
-        # ═══════════════════════════════════════════════════════════
-        
         if od.buy_orders and od.sell_orders:
             best_bid = max(od.buy_orders.keys())
             best_ask = min(od.sell_orders.keys())
@@ -509,50 +539,120 @@ class Trader:
             best_bid = fv - 8
             best_ask = fv + 8
 
-        # ── Step 1: Blend in with market (Hint #2) ────────────
-        # Instead of quoting FV ± 2 and being overly generous, we just 
-        # step 1 tick in front of actual market to ensure priority.
-        natural_bid = best_bid + 1
-        natural_ask = best_ask - 1
+        # Dynamic extreme thresholds based on current fair value
+        extreme_buy = fv - 8
+        extreme_sell = fv + 8
+        
+        # Extreme-zone stat-arb take layer for strong mean-reversion dislocations.
+        # This is complementary to normal edge-taking and maker quoting.
+        if mid <= extreme_buy and buy_cap > 0 and od.sell_orders:
+            remaining = min(buy_cap, self.ACO_EXTREME_SIZE)
+            for ask_px in sorted(od.sell_orders.keys()):
+                if remaining <= 0:
+                    break
+                if ask_px > extreme_buy + 3:
+                    break
+                qty = min(remaining, abs(od.sell_orders[ask_px]))
+                if qty > 0:
+                    orders.append(Order(product, ask_px, qty))
+                    remaining -= qty
+            buy_cap -= min(buy_cap, self.ACO_EXTREME_SIZE) - remaining
 
-        # ── Step 2: Apply Fair Value Protection ───────────────────
-        # We never want to quote worse than our calculated Fair Value.
-        # If market goes crazy, our FV acts as a hard boundary.
-        bid_price = int(min(natural_bid, fv - 1))
-        ask_price = int(max(natural_ask, fv + 1))
+        if mid >= extreme_sell and sell_cap > 0 and od.buy_orders:
+            remaining = min(sell_cap, self.ACO_EXTREME_SIZE)
+            for bid_px in sorted(od.buy_orders.keys(), reverse=True):
+                if remaining <= 0:
+                    break
+                if bid_px < extreme_sell - 3:
+                    break
+                qty = min(remaining, od.buy_orders[bid_px])
+                if qty > 0:
+                    orders.append(Order(product, bid_px, -qty))
+                    remaining -= qty
+            sell_cap -= min(sell_cap, self.ACO_EXTREME_SIZE) - remaining
 
-        # ── Dynamic size scaling based on position ───────────────
-        if abs(pos) < 30:
-            size = 20
-        elif abs(pos) < 60:
-            size = 12
+        # ── Phase 1: Selective taking when clear edge exists ─────
+        # We only cross when the edge is meaningfully larger than fees/noise.
+        take_edge = self.ACO_TAKE_EDGE
+        if best_ask <= fv - take_edge and buy_cap > 0:
+            if abs(best_ask - fv) > 5:
+                take_qty = min(buy_cap, abs(od.sell_orders[best_ask]), 40)
+            else:
+                take_qty = min(buy_cap, abs(od.sell_orders[best_ask]), 24)
+            if take_qty > 0:
+                orders.append(Order(product, best_ask, take_qty))
+                buy_cap -= take_qty
+
+        if best_bid >= fv + take_edge and sell_cap > 0:
+            if abs(best_bid - fv) > 5:
+                take_qty = min(sell_cap, od.buy_orders[best_bid], 40)
+            else:
+                take_qty = min(sell_cap, od.buy_orders[best_bid], 24)
+            if take_qty > 0:
+                orders.append(Order(product, best_bid, -take_qty))
+                sell_cap -= take_qty
+
+        # ── Phase 2: Inventory-aware passive market making ───────
+        if pos > 60:
+            inv_shift = -3
+        elif pos > 30:
+            inv_shift = -2
+        elif pos < -60:
+            inv_shift = 3
+        elif pos < -30:
+            inv_shift = 2
         else:
-            size = 6
+            inv_shift = 0
 
-        # ── Execute L1 Make ───────────────────────────────────────
+        # Spread adapts to current top-of-book width.
+        spread = max(1, best_ask - best_bid)
+        base_offset = 1 if spread <= 3 else 2
+
+        make_fv = fv + inv_shift
+        bid_l1 = best_bid + 1 if best_bid + 1 < make_fv else make_fv - base_offset
+        ask_l1 = best_ask - 1 if best_ask - 1 > make_fv else make_fv + base_offset
+
+        # Micro aggression in tight markets
+        if spread <= 3:
+            bid_l1 += 1
+            ask_l1 -= 1
+
+        # Guarantee non-crossing passive quotes.
+        if bid_l1 >= ask_l1:
+            bid_l1 = make_fv - 1
+            ask_l1 = make_fv + 1
+
+        # Lean size toward flattening inventory.
+        size_buy = self.ACO_MAKE_SIZE_1
+        size_sell = self.ACO_MAKE_SIZE_1
+        if pos > 30:
+            size_buy = self.ACO_MAKE_SIZE_2
+            size_sell = self.ACO_MAKE_SIZE_1 + 4
+        elif pos < -30:
+            size_buy = self.ACO_MAKE_SIZE_1 + 4
+            size_sell = self.ACO_MAKE_SIZE_2
+
         if buy_cap > 0:
-            l1_bid = min(buy_cap, size)
-            orders.append(Order(product, bid_price, l1_bid))
-            buy_cap -= l1_bid
+            q = min(buy_cap, size_buy)
+            orders.append(Order(product, int(bid_l1), q))
+            buy_cap -= q
 
         if sell_cap > 0:
-            l1_ask = min(sell_cap, size)
-            orders.append(Order(product, ask_price, -l1_ask))
-            sell_cap -= l1_ask
+            q = min(sell_cap, size_sell)
+            orders.append(Order(product, int(ask_l1), -q))
+            sell_cap -= q
 
-        # ── Sponge: Catch dislocations (Wide Orders) ──────────────
+        # L2 quotes improve fill rate without overexposing size.
         if buy_cap > 0:
-            orders.append(Order(product, bid_price - 4, buy_cap))
+            q = min(buy_cap, self.ACO_MAKE_SIZE_2)
+            orders.append(Order(product, int(bid_l1 - 2), q))
 
         if sell_cap > 0:
-            orders.append(Order(product, ask_price + 4, -sell_cap))
+            q = min(sell_cap, self.ACO_MAKE_SIZE_2)
+            orders.append(Order(product, int(ask_l1 + 2), -q))
 
         # ── AUCTION SIMULATION: Maximum Unpunished Size Algorithm ─────────────────
-        #    Only run during auction periods to avoid damaging PnL during continuous trading
-        is_auction_state = (len(state.own_trades.get(product, [])) == 0 and state.timestamp == 0)
-        
-        if is_auction_state:
-            auction_orders = self.optimize_auction_order(product, od)
-            orders.extend(auction_orders)
+        auction_orders = self.optimize_auction_order(product, od)
+        orders.extend(auction_orders)
 
         return orders
