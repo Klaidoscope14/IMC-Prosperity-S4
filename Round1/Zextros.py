@@ -499,60 +499,37 @@ class Trader:
         sell_cap = self.LIMIT + pos   # Max additional sell volume
 
         # ═══════════════════════════════════════════════════════════
-        #  PURE MAKE — Earn the spread around fair value
-        #
-        #  Place passive limit orders only:
-        #    BID = FV - offset   (buy below fair value)
-        #    ASK = FV + offset   (sell above fair value)
-        #
-        #  NEVER TAKE liquidity - avoid crossing the spread.
-        #  Earn spread when market oscillates around FV.
-        #
-        #  Inventory skew provides calm position adjustments.
+        #  PHASE 2: MAKE — The "Intentional & Calm" Spread Capture
         # ═══════════════════════════════════════════════════════════
-
-        # Calculate adaptive spread based on market spread
-        spread = 0
+        
         if od.buy_orders and od.sell_orders:
             best_bid = max(od.buy_orders.keys())
             best_ask = min(od.sell_orders.keys())
-            spread = best_ask - best_bid
-        
-        # Adaptive offset based on market spread
-        if spread >= 12:
-            offset = 3
-        elif spread >= 8:
-            offset = 2
         else:
-            offset = 1
-        
-        bid_price = int(fv - offset)
-        ask_price = int(fv + offset)
+            best_bid = fv - 8
+            best_ask = fv + 8
 
-        # ── Dynamic size scaling based on position ───────────────────────
+        # ── Step 1: Blend in with market (Hint #2) ────────────
+        # Instead of quoting FV ± 2 and being overly generous, we just 
+        # step 1 tick in front of actual market to ensure priority.
+        natural_bid = best_bid + 1
+        natural_ask = best_ask - 1
+
+        # ── Step 2: Apply Fair Value Protection ───────────────────
+        # We never want to quote worse than our calculated Fair Value.
+        # If market goes crazy, our FV acts as a hard boundary.
+        bid_price = int(min(natural_bid, fv - 1))
+        ask_price = int(max(natural_ask, fv + 1))
+
+        # ── Dynamic size scaling based on position ───────────────
         if abs(pos) < 30:
             size = 20
         elif abs(pos) < 60:
             size = 12
         else:
             size = 6
-        
-        # ---- Trend-based behavior adjustments ----
-        # 🚀 Use trend for behavior adjustment, NOT heavy FV changes
-        
-        # 🔹 Case 1: Upward "vibe"
-        if trend == "up":
-            # be more aggressive buyer
-            bid_price += 1
-            size = int(size * 1.3)
-        
-        # 🔹 Case 2: Downward "vibe"
-        if trend == "down":
-            # be more aggressive seller
-            ask_price -= 1
-            size = int(size * 1.3)
 
-        # ── L1 Make: FV ± 2 ───────────────────────────────────────
+        # ── Execute L1 Make ───────────────────────────────────────
         if buy_cap > 0:
             l1_bid = min(buy_cap, size)
             orders.append(Order(product, bid_price, l1_bid))
@@ -563,16 +540,12 @@ class Trader:
             orders.append(Order(product, ask_price, -l1_ask))
             sell_cap -= l1_ask
 
-        # ── L2 Make: FV ± 2*offset (deeper liquidity) ────────────────────
+        # ── Sponge: Catch dislocations (Wide Orders) ──────────────
         if buy_cap > 0:
-            l2_bid = min(buy_cap, size)
-            orders.append(Order(product, int(bid_price - offset), l2_bid))
-            buy_cap -= l2_bid
+            orders.append(Order(product, bid_price - 4, buy_cap))
 
         if sell_cap > 0:
-            l2_ask = min(sell_cap, size)
-            orders.append(Order(product, int(ask_price + offset), -l2_ask))
-            sell_cap -= l2_ask
+            orders.append(Order(product, ask_price + 4, -sell_cap))
 
         # ── AUCTION SIMULATION: Maximum Unpunished Size Algorithm ─────────────────
         #    Only run during auction periods to avoid damaging PnL during continuous trading
@@ -581,14 +554,5 @@ class Trader:
         if is_auction_state:
             auction_orders = self.optimize_auction_order(product, od)
             orders.extend(auction_orders)
-
-        # ── Sponge: absorb remaining capacity at wide prices ──────
-        #    FV ± 8 — catches flash crashes/spikes.  Rarely fills
-        #    but costs nothing to have on the book.
-        if buy_cap > 0:
-            orders.append(Order(product, int(bid_price - offset * 2), buy_cap))
-
-        if sell_cap > 0:
-            orders.append(Order(product, int(ask_price + offset * 2), -sell_cap))
 
         return orders
