@@ -19,8 +19,8 @@ V4 corrects BOTH failure modes:
        being passive, no edge in selling, no edge in EMA math.
        BUY TO 80 IMMEDIATELY.  HOLD FOREVER.  NEVER SELL.
 
-  ACO: Mean-reverts around 10,000.  The edge is in the math:
-       FV = 50% fast_EMA + 50% anchor.  MAKE the spread at FV ± offset.
+  ACO: Mean-reverts around 10,001.  The edge is in the math:
+       FV = 50% fast_EMA + 50% slow_anchor.  MAKE the spread at FV ± offset.
        NEVER TAKE liquidity.  Use inventory skew for calm adjustments.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -40,7 +40,7 @@ class Trader:
     MAX_LOT = 12  # Max lots per individual order
 
     # ── ACO: Book-Relative Market Making ────────────────────────────
-    ACO_ANCHOR = 10000
+    ACO_ANCHOR = 10001
     ACO_SKEW_TICKS = 3
     ACO_TAKER_QTY = 15
     ACO_BUY_ZONE = 9995
@@ -74,7 +74,7 @@ class Trader:
         return result, conversions, self._save(td)
 
     def bid(self) -> int:
-        return 10000
+        return 10001
 
     # ╔════════════════════════════════════════════════════════════════╗
     # ║                    STATE MANAGEMENT                           ║
@@ -130,12 +130,35 @@ class Trader:
         """Current position in a product (0 if none)."""
         return state.position.get(product, 0)
 
-    @staticmethod
-    def _mid(od: OrderDepth) -> Optional[float]:
-        """Simple mid-price: (best_bid + best_ask) / 2."""
-        if not od.buy_orders or not od.sell_orders:
-            return None
-        return (max(od.buy_orders.keys()) + min(od.sell_orders.keys())) / 2.0
+    def _mid(self, od: OrderDepth, product: str, td: dict) -> Optional[float]:
+        """Calculates mid-price, gracefully handling one-sided/empty books."""
+        raw_mid = None
+        if od.buy_orders and od.sell_orders:
+            raw_mid = (max(od.buy_orders.keys()) + min(od.sell_orders.keys())) / 2.0
+            
+        key_last = f"{product}_last_valid_mid"
+        key_stale = f"{product}_mid_stale"
+        
+        if raw_mid is not None:
+            td[key_last] = raw_mid
+            td[key_stale] = 0
+            return raw_mid
+            
+        # Carry forward the last valid mid for a short window
+        td[key_stale] = td.get(key_stale, 0) + 1
+        stale = td[key_stale]
+        last_mid = td.get(key_last)
+        
+        if last_mid is not None and stale < 15:
+            # Constrain by visible book sides to keep stability without inventing signal
+            adj_mid = last_mid
+            if od.buy_orders:
+                adj_mid = max(adj_mid, max(od.buy_orders.keys()) + 0.5)
+            if od.sell_orders:
+                adj_mid = min(adj_mid, min(od.sell_orders.keys()) - 0.5)
+            return adj_mid
+            
+        return None
 
     @staticmethod
     def _obi(od: OrderDepth) -> float:
@@ -409,10 +432,11 @@ class Trader:
                     pos += o.quantity
 
         # Track short-horizon drift to choose a stronger refill bid when asks are thin.
-        if od.buy_orders and od.sell_orders:
-            ipr_mid = (max(od.buy_orders.keys()) + min(od.sell_orders.keys())) / 2.0
-            if td["ipr_last_mid"] is not None:
+        ipr_mid = self._mid(od, product, td)
+        if ipr_mid is not None:
+            if td["ipr_last_mid"] is not None and td.get(f"{product}_mid_stale", 0) == 0:
                 step = ipr_mid - td["ipr_last_mid"]
+                # Only update drift on entirely fresh data
                 td["ipr_drift_ema"] = 0.25 * step + 0.75 * td["ipr_drift_ema"]
             td["ipr_last_mid"] = ipr_mid
 
@@ -479,9 +503,9 @@ class Trader:
     # ║   ASH_COATED_OSMIUM — PURE MARKET MAKER                    ║
     # ╚════════════════════════════════════════════════════════════════╝
     #
-    #  Mean-reverts around 10,000.  The edge is purely mathematical:
+    #  Mean-reverts around 10,001.  The edge is purely mathematical:
     #
-    #  FV = 50% × fast_EMA + 50% × 10,000
+    #  FV = 50% × fast_EMA + 50% × slow_anchor
     #
     #  PURE MAKE: Place passive limit orders only at FV ± offset.
     #             NEVER TAKE liquidity - avoid crossing the spread.
@@ -507,20 +531,26 @@ class Trader:
         sell_cap = self.LIMIT + pos
 
         # Slow anchor EMA — only updates 10% of the EMA per ~500 ticks
-        ANCHOR_BASE = 10000
+        ANCHOR_BASE = 10001
         ANCHOR_ALPHA = 0.001   # very slow, avoids chasing noise
         
         # Update EMA and anchor
-        mid = self._mid(od)
+        mid = self._mid(od, product, td)
+        
+        # decay confidence slowly (if staleness > 0, EMA alpha drops)
+        stale = td.get(f"{product}_mid_stale", 0)
+        alpha = 0.20 if stale == 0 else max(0.01, 0.20 * (0.8 ** stale))
+        a_alpha = ANCHOR_ALPHA if stale == 0 else max(0.0001, ANCHOR_ALPHA * (0.8 ** stale))
+
         if td.get("aco_ema") is None:
             td["aco_ema"] = mid if mid is not None else ANCHOR_BASE
         elif mid is not None:
-            td["aco_ema"] = 0.20 * mid + 0.80 * td["aco_ema"]
+            td["aco_ema"] = alpha * mid + (1 - alpha) * td["aco_ema"]
             
         if td.get("aco_anchor") is None:
             td["aco_anchor"] = ANCHOR_BASE
         elif mid is not None:
-            td["aco_anchor"] = ANCHOR_ALPHA * mid + (1 - ANCHOR_ALPHA) * td["aco_anchor"]
+            td["aco_anchor"] = a_alpha * mid + (1 - a_alpha) * td["aco_anchor"]
 
         anchor = td["aco_anchor"]
         FV = round(0.50 * td["aco_ema"] + 0.50 * anchor)
@@ -531,10 +561,10 @@ class Trader:
         buy_up_to = FV
         sell_down_to = FV
 
-        if pos > 40:  sell_down_to = FV - 1    # also sell bids >= 10000
+        if pos > 40:  sell_down_to = FV - 1    # also sell bids >= 10000 (if FV=10001)
         if pos > 70:  sell_down_to = FV - 2    # also sell bids >= 9999
-        if pos < -40: buy_up_to = FV + 1       # also buy asks <= 10000
-        if pos < -70: buy_up_to = FV + 2       # also buy asks <= 10001
+        if pos < -40: buy_up_to = FV + 1       # also buy asks <= 10002
+        if pos < -70: buy_up_to = FV + 2       # also buy asks <= 10003
 
         if od.sell_orders:
             for ask_px in sorted(od.sell_orders.keys()):
