@@ -419,7 +419,7 @@ class Trader:
         # How much more can we buy? (Hard limit enforcement)
         # Increase avg batch from 8.0 → 11.5 to match mean L1 ask volume (11.5 lots).
         # Every tick at pos < 80 costs ~8 XIRECs in missed drift. Fill faster.
-        batch_sequence = [8 ,9 ,8 ,9]
+        batch_sequence = [11, 12, 11, 12]
         idx = td.get("ipr_batch_idx", 0)
         batch_size = batch_sequence[idx % len(batch_sequence)]
         
@@ -507,7 +507,7 @@ class Trader:
         sell_cap = self.LIMIT + pos
 
         # Slow anchor EMA — only updates 10% of the EMA per ~500 ticks
-        ANCHOR_BASE = 10001
+        ANCHOR_BASE = 10000
         ANCHOR_ALPHA = 0.001   # very slow, avoids chasing noise
         
         # Update EMA and anchor
@@ -556,58 +556,18 @@ class Trader:
 
         # Phase 2: book-relative maker quotes capped at fair value edges.
         # PROVEN LOGIC — unchanged. All capacity at single best level.
-        best_bid = max(od.buy_orders.keys()) if od.buy_orders else FV - 40
-        best_ask = min(od.sell_orders.keys()) if od.sell_orders else FV + 40
+        best_bid = max(od.buy_orders.keys()) if od.buy_orders else FV - 100
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else FV + 100
 
         our_bid = min(best_bid + 1, FV - 1)
         our_ask = max(best_ask - 1, FV + 1)
 
-        # ═══════════════════════════════════════════════════════════
-        #  ORDER LADDERING / SLICING (The Shield & Net)
-        # ═══════════════════════════════════════════════════════════
-        
-        MAX_LOT = 12
-        TICK_STEP = 2  # The gap between your slices (e.g., L1 at 9999, L2 at 9997)
-        
-        # Base L1 Prices (from your Smart Pegging / FV logic)
-        l1_bid = our_bid 
-        l1_ask = our_ask
-        
-        # ─── BID LADDERING ─────────────────────────────────────────
         if buy_cap > 0:
-            # Level 1: The Front Line (Catches standard retail noise)
-            qty1 = min(buy_cap, MAX_LOT)
-            orders.append(Order(product, l1_bid, qty1))
-            buy_cap -= qty1
-            
-        if buy_cap > 0:
-            # Level 2: The Medium Net (Catches aggressive sweeps)
-            qty2 = min(buy_cap, MAX_LOT)
-            orders.append(Order(product, l1_bid - TICK_STEP, qty2))
-            buy_cap -= qty2
-            
-        if buy_cap > 0:
-            # Level 3: The Deep Sponge (Catches extreme fat-finger crashes)
-            # We dump all remaining capacity here at a massive discount
-            orders.append(Order(product, l1_bid - (TICK_STEP * 2), buy_cap))
+            orders.append(Order(product, our_bid, buy_cap))
             buy_cap = 0
 
-        # ─── ASK LADDERING ─────────────────────────────────────────
         if sell_cap > 0:
-            # Level 1
-            qty1 = min(sell_cap, MAX_LOT)
-            orders.append(Order(product, l1_ask, -qty1))  # Remember: asks are negative
-            sell_cap -= qty1
-            
-        if sell_cap > 0:
-            # Level 2
-            qty2 = min(sell_cap, MAX_LOT)
-            orders.append(Order(product, l1_ask + TICK_STEP, -qty2))
-            sell_cap -= qty2
-            
-        if sell_cap > 0:
-            # Level 3
-            orders.append(Order(product, l1_ask + (TICK_STEP * 2), -sell_cap))
+            orders.append(Order(product, our_ask, -sell_cap))
             sell_cap = 0
 
         return orders
