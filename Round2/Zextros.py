@@ -130,35 +130,12 @@ class Trader:
         """Current position in a product (0 if none)."""
         return state.position.get(product, 0)
 
-    def _mid(self, od: OrderDepth, product: str, td: dict) -> Optional[float]:
-        """Calculates mid-price, gracefully handling one-sided/empty books."""
-        raw_mid = None
-        if od.buy_orders and od.sell_orders:
-            raw_mid = (max(od.buy_orders.keys()) + min(od.sell_orders.keys())) / 2.0
-            
-        key_last = f"{product}_last_valid_mid"
-        key_stale = f"{product}_mid_stale"
-        
-        if raw_mid is not None:
-            td[key_last] = raw_mid
-            td[key_stale] = 0
-            return raw_mid
-            
-        # Carry forward the last valid mid for a short window
-        td[key_stale] = td.get(key_stale, 0) + 1
-        stale = td[key_stale]
-        last_mid = td.get(key_last)
-        
-        if last_mid is not None and stale < 15:
-            # Constrain by visible book sides to keep stability without inventing signal
-            adj_mid = last_mid
-            if od.buy_orders:
-                adj_mid = max(adj_mid, max(od.buy_orders.keys()) + 0.5)
-            if od.sell_orders:
-                adj_mid = min(adj_mid, min(od.sell_orders.keys()) - 0.5)
-            return adj_mid
-            
-        return None
+    @staticmethod
+    def _mid(od: OrderDepth) -> Optional[float]:
+        """Simple mid-price: (best_bid + best_ask) / 2."""
+        if not od.buy_orders or not od.sell_orders:
+            return None
+        return (max(od.buy_orders.keys()) + min(od.sell_orders.keys())) / 2.0
 
     @staticmethod
     def _obi(od: OrderDepth) -> float:
@@ -432,11 +409,10 @@ class Trader:
                     pos += o.quantity
 
         # Track short-horizon drift to choose a stronger refill bid when asks are thin.
-        ipr_mid = self._mid(od, product, td)
-        if ipr_mid is not None:
-            if td["ipr_last_mid"] is not None and td.get(f"{product}_mid_stale", 0) == 0:
+        if od.buy_orders and od.sell_orders:
+            ipr_mid = (max(od.buy_orders.keys()) + min(od.sell_orders.keys())) / 2.0
+            if td["ipr_last_mid"] is not None:
                 step = ipr_mid - td["ipr_last_mid"]
-                # Only update drift on entirely fresh data
                 td["ipr_drift_ema"] = 0.25 * step + 0.75 * td["ipr_drift_ema"]
             td["ipr_last_mid"] = ipr_mid
 
@@ -535,22 +511,16 @@ class Trader:
         ANCHOR_ALPHA = 0.001   # very slow, avoids chasing noise
         
         # Update EMA and anchor
-        mid = self._mid(od, product, td)
-        
-        # decay confidence slowly (if staleness > 0, EMA alpha drops)
-        stale = td.get(f"{product}_mid_stale", 0)
-        alpha = 0.20 if stale == 0 else max(0.01, 0.20 * (0.8 ** stale))
-        a_alpha = ANCHOR_ALPHA if stale == 0 else max(0.0001, ANCHOR_ALPHA * (0.8 ** stale))
-
+        mid = self._mid(od)
         if td.get("aco_ema") is None:
             td["aco_ema"] = mid if mid is not None else ANCHOR_BASE
         elif mid is not None:
-            td["aco_ema"] = alpha * mid + (1 - alpha) * td["aco_ema"]
+            td["aco_ema"] = 0.20 * mid + 0.80 * td["aco_ema"]
             
         if td.get("aco_anchor") is None:
             td["aco_anchor"] = ANCHOR_BASE
         elif mid is not None:
-            td["aco_anchor"] = a_alpha * mid + (1 - a_alpha) * td["aco_anchor"]
+            td["aco_anchor"] = ANCHOR_ALPHA * mid + (1 - ANCHOR_ALPHA) * td["aco_anchor"]
 
         anchor = td["aco_anchor"]
         FV = round(0.50 * td["aco_ema"] + 0.50 * anchor)
