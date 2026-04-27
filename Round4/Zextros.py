@@ -4,7 +4,6 @@ from collections import defaultdict
 import json
 import math
 
-
 class Trader:
     """Round 3 model built around:
     - microprice / wall-mid fair value for underlyings
@@ -102,7 +101,7 @@ class Trader:
     VE_INVENTORY_SKEW_K = 4.0    # inventory skew for passive quotes
 
     # Round 3 starts with 5 days to expiry in the final sim.
-    TTE_START_DAYS = 7.0
+    TTE_START_DAYS = 4.0
     TICKS_PER_DAY = 1_000_000
 
     # Anchors / smoothing
